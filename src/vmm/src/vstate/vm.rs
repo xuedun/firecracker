@@ -11,6 +11,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use vm_memory::Address;
 
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::KVM_IRQCHIP_IOAPIC;
@@ -92,6 +93,8 @@ pub enum VmError {
     ResourceAllocator(#[from] vm_allocator::Error),
     /// MemoryError error: {0}
     MemoryError(#[from] MemoryError),
+    /// Guest region address does not match any state region.
+    InvalidGuestRegionAddress,
 }
 
 /// Contains Vm functions that are usable across CPU architectures
@@ -258,8 +261,22 @@ impl Vm {
         regions: Vec<GuestRegionMmap>,
         state: &GuestMemoryState,
     ) -> Result<(), VmError> {
-        for (region, state) in regions.into_iter().zip(state.regions.iter()) {
-            let slot_cnt = state
+        for region in regions {
+            // Find the state region that contains this GuestRegionMmap's start address.
+            // In dual-backend mode, one state region may be split into multiple
+            // GuestRegionMmap entries, so we match by GPA range, not 1:1 zip.
+            let region_start = region.start_addr().raw_value();
+            let matching_state = state
+                .regions
+                .iter()
+                .find(|s| {
+                    let s_start = s.base_address;
+                    let s_end = s_start + s.size as u64;
+                    region_start >= s_start && region_start < s_end
+                })
+                .ok_or(VmError::InvalidGuestRegionAddress)?;
+
+            let slot_cnt = matching_state
                 .plugged
                 .len()
                 .try_into()
@@ -269,7 +286,8 @@ impl Vm {
                 .next_kvm_slot(slot_cnt)
                 .ok_or(VmError::NotEnoughMemorySlots(self.common.max_memslots))?;
 
-            let arcd_region = Arc::new(GuestRegionMmapExt::from_state(region, state, next_slot)?);
+            let arcd_region =
+                Arc::new(GuestRegionMmapExt::from_state(region, matching_state, next_slot)?);
 
             self.register_memory_region(arcd_region)?
         }

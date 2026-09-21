@@ -15,6 +15,39 @@ and this project adheres to
   page-aligned guest-physical ranges across the available vCPUs using
   `KVM_PRE_FAULT_MEMORY`; aarch64 remains unsupported. This release does not
   change startup, restore behavior, or the snapshot serialization/data format.
+- Dual-backend memory snapshot restore: add optional `region_backends` field
+  to `MemoryBackend` (`PUT /snapshot/load`). When provided, Firecracker mmaps
+  different backend files for different GPA ranges, enabling cross-template
+  buffer cache sharing of base pages. Each `RegionBackendConfig` entry maps a
+  `file_offset` + `size` range (position within the contiguous guest memory
+  layout) to a `backend_path`. Ranges that cross the MMIO hole are
+  automatically split. When `region_backends` is absent, Firecracker falls
+  back to single-backend mode using `backend_path`. New functions:
+  - `guest_memory_from_multi_backend()` in `persist.rs`: converts file offsets
+    to GPAs using `GuestMemoryState`, opens each distinct backend file once
+    (sharing the `Arc<File>`), and mmaps each sub-range with `MAP_PRIVATE`.
+  - `snapshot_file_with_offset()` and `create_with_offset()` in
+    `vstate/memory.rs`: like `snapshot_file`/`create` but accept an `Arc<File>`
+    + starting offset, so multiple backend ranges can share the same fd at
+    different offsets.
+
+### Fixed
+
+- `restore_memory_regions` in `vstate/vm.rs` used `Iterator::zip` for 1:1
+  pairing of `Vec<GuestRegionMmap>` with `GuestMemoryState.regions`. In
+  dual-backend mode, one state region is split into multiple
+  `GuestRegionMmap` entries, so the `zip` silently dropped all entries beyond
+  the state region count, resulting in only partial guest memory being
+  registered with KVM. Fixed by matching each `GuestRegionMmap` to the
+  containing state region by GPA range lookup instead of 1:1 zip.
+- `Vm::restore_state` in `arch/aarch64/vm.rs` returned a hard
+  `ArchVmError::RestoreGic` when `GICDevice::restore_device` failed with
+  `EINVAL` on non-standard aarch64 platforms (e.g. custom GICv3
+  implementations where certain distributor/redistributor attributes are
+  read-only or unsupported by the host kernel's KVM GIC driver). Changed to
+  log a warning and continue, allowing snapshot restore to proceed so that
+  memory mapping can still be validated on such platforms. The GIC state
+  will be in its default (reset) configuration on these platforms.
 
 ## [1.15.1]
 

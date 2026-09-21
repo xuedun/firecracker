@@ -111,6 +111,26 @@ pub struct LoadSnapshotConfig {
     pub clock_realtime: bool,
 }
 
+/// Describes a per-GPA-range backend mapping for dual-backend memory sharing.
+///
+/// When `MemBackendConfig::region_backends` is provided, Firecracker mmaps
+/// different backend files for different GPA ranges, enabling cross-template
+/// buffer cache sharing of base pages.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegionBackendConfig {
+    /// Starting file offset (position within the contiguous guest memory
+    /// layout) of this backend range. Firecracker internally converts this
+    /// to a guest physical address using `GuestMemoryState`, accounting for
+    /// the MMIO hole. Ranges that cross the hole are automatically split.
+    /// This value is also used as the mmap offset into the backend device.
+    pub file_offset: u64,
+    /// Size in bytes of the range covered by this backend.
+    pub size: u64,
+    /// Path to the backend file or block device for this range.
+    pub backend_path: PathBuf,
+}
+
 /// Stores the configuration used for managing snapshot memory.
 #[derive(Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -119,6 +139,12 @@ pub struct MemBackendConfig {
     pub backend_path: PathBuf,
     /// Specifies the guest memory backend type.
     pub backend_type: MemBackendType,
+    /// Optional per-GPA-range backend mapping for dual-backend memory sharing.
+    /// When provided, Firecracker mmaps different backend files for different
+    /// GPA ranges. When absent, falls back to single-backend mode using
+    /// `backend_path`.
+    #[serde(default)]
+    pub region_backends: Option<Vec<RegionBackendConfig>>,
 }
 
 /// The microVM state options.

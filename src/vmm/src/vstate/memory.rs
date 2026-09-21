@@ -8,6 +8,7 @@
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::ops::Deref;
+use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
 
 use bitvec::vec::BitVec;
@@ -671,6 +672,89 @@ pub fn snapshot_file(
         regions.into_iter(),
         libc::MAP_PRIVATE,
         Some(file),
+        track_dirty_pages,
+    )
+}
+
+/// Like [`create`], but accepts an already-shared `Arc<File>` and a starting
+/// offset, so that multiple groups of regions can map from different offsets
+/// of the same device (or from different devices entirely) in a single
+/// multi-backend restore.
+pub fn create_with_offset(
+    regions: impl Iterator<Item = (GuestAddress, usize)>,
+    mmap_flags: libc::c_int,
+    file: Option<Arc<File>>,
+    base_offset: u64,
+    track_dirty_pages: bool,
+) -> Result<Vec<GuestRegionMmap>, MemoryError> {
+    let mut offset = base_offset;
+    regions
+        .map(|(start, size)| {
+            let mut builder = MmapRegionBuilder::new_with_bitmap(
+                size,
+                track_dirty_pages.then(|| AtomicBitmap::with_len(size)),
+            )
+            .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
+            .with_mmap_flags(libc::MAP_NORESERVE | mmap_flags);
+
+            if let Some(ref file) = file {
+                let file_offset = FileOffset::from_arc(Arc::clone(file), offset);
+                builder = builder.with_file_offset(file_offset);
+            }
+
+            offset = match offset.checked_add(size as u64) {
+                None => return Err(MemoryError::OffsetTooLarge),
+                Some(new_off) if new_off >= i64::MAX as u64 => {
+                    return Err(MemoryError::OffsetTooLarge);
+                }
+                Some(new_off) => new_off,
+            };
+
+            GuestRegionMmap::new(
+                builder.build().map_err(MemoryError::MmapRegionError)?,
+                start,
+            )
+            .ok_or(MemoryError::VmMemoryError)
+        })
+        .collect::<Result<Vec<_>, _>>()
+}
+
+/// Like [`snapshot_file`], but accepts an `Arc<File>` and a starting offset
+/// so that multiple backend ranges can share the same fd at different offsets.
+pub fn snapshot_file_with_offset(
+    file: Arc<File>,
+    base_offset: u64,
+    regions: impl Iterator<Item = (GuestAddress, usize)>,
+    track_dirty_pages: bool,
+) -> Result<Vec<GuestRegionMmap>, MemoryError> {
+    let regions: Vec<_> = regions.collect();
+    let memory_size = regions
+        .iter()
+        .try_fold(0u64, |acc, (_, size)| acc.checked_add(*size as u64))
+        .ok_or(MemoryError::OffsetTooLarge)?;
+
+    // Use lseek via raw fd to determine the backing file size. This avoids
+    // needing &mut access to the Arc<File> (File::seek requires &mut self).
+    // For block devices (e.g. ublk) fstat returns st_size=0, whereas
+    // lseek(SEEK_END) returns the actual device capacity.
+    let ret = unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_END) };
+    if ret < 0 {
+        return Err(MemoryError::SeekError(std::io::Error::last_os_error()));
+    }
+    let file_size = ret as u64;
+
+    let mapped_end = base_offset
+        .checked_add(memory_size)
+        .ok_or(MemoryError::OffsetTooLarge)?;
+    if mapped_end > file_size {
+        return Err(MemoryError::OffsetTooLarge);
+    }
+
+    create_with_offset(
+        regions.into_iter(),
+        libc::MAP_PRIVATE,
+        Some(file),
+        base_offset,
         track_dirty_pages,
     )
 }

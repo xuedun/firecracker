@@ -36,10 +36,13 @@ use crate::utils::u64_to_usize;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
-use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
+use crate::vmm_config::snapshot::{
+    CreateSnapshotParams, LoadSnapshotParams, MemBackendType, RegionBackendConfig,
+};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
-    self, GuestMemoryState, GuestMmapRegion, GuestRegionMmap, GuestRegionType, MemoryError,
+    self, GuestAddress, GuestMemoryState, GuestMmapRegion, GuestRegionMmap, GuestRegionType,
+    MemoryError,
 };
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
@@ -428,11 +431,19 @@ pub fn restore_from_snapshot(
                 )
                 .into());
             }
-            (
-                guest_memory_from_file(mem_backend_path, mem_state, track_dirty_pages)
-                    .map_err(RestoreFromSnapshotGuestMemoryError::File)?,
-                None,
-            )
+            if let Some(ref region_backends) = params.mem_backend.region_backends {
+                (
+                    guest_memory_from_multi_backend(region_backends, mem_state, track_dirty_pages)
+                        .map_err(RestoreFromSnapshotGuestMemoryError::File)?,
+                    None,
+                )
+            } else {
+                (
+                    guest_memory_from_file(mem_backend_path, mem_state, track_dirty_pages)
+                        .map_err(RestoreFromSnapshotGuestMemoryError::File)?,
+                    None,
+                )
+            }
         }
         MemBackendType::Uffd => guest_memory_from_uffd(
             mem_backend_path,
@@ -494,6 +505,118 @@ fn guest_memory_from_file(
     let mem_file = File::open(mem_file_path)?;
     let guest_mem = memory::snapshot_file(mem_file, mem_state.regions(), track_dirty_pages)?;
     Ok(guest_mem)
+}
+
+/// Build guest memory from multiple per-range backends (dual-backend mode).
+///
+/// Each `RegionBackendConfig` describes a **file offset** range mapped to a
+/// specific backend file at a given offset. The function:
+/// 1. Converts each file offset to a GPA using `GuestMemoryState`, splitting
+///    ranges that cross the MMIO hole.
+/// 2. Opens each distinct backend file once (sharing the `Arc<File>`).
+/// 3. mmaps each sub-range with `MAP_PRIVATE`.
+/// 4. Returns a sorted `Vec<GuestRegionMmap>` for KVM registration.
+fn guest_memory_from_multi_backend(
+    region_backends: &[RegionBackendConfig],
+    mem_state: &GuestMemoryState,
+    track_dirty_pages: bool,
+) -> Result<Vec<GuestRegionMmap>, GuestMemoryFromFileError> {
+    // --- Phase 1: convert file offsets to GPAs, splitting across MMIO hole ---
+
+    /// A sub-range after file-offset→GPA conversion.
+    struct SubRange {
+        gpa: u64,
+        gpa_size: usize,
+        backend_path: std::path::PathBuf,
+        // mmap offset into the backend device (= original file_offset).
+        mmap_offset: u64,
+    }
+
+    let mut sub_ranges: Vec<SubRange> = Vec::new();
+
+    eprintln!("DEBUG multi_backend: mem_state has {} regions", mem_state.regions.len());
+    for (i, r) in mem_state.regions.iter().enumerate() {
+        eprintln!("DEBUG multi_backend: region[{}] base=0x{:x} size={} (0x{:x})", i, r.base_address, r.size, r.size);
+    }
+
+    for rb in region_backends {
+        eprintln!("DEBUG multi_backend: region_backend file_offset={} size={} path={}", rb.file_offset, rb.size, rb.backend_path.display());
+        let mut file_off = rb.file_offset;
+        let mut remaining = usize::try_from(rb.size)
+            .map_err(|_| MemoryError::OffsetTooLarge)?;
+
+        while remaining > 0 {
+            // Find which guest memory region this file offset falls into.
+            let mut cumulative = 0u64;
+            let mut matched = false;
+            for r in &mem_state.regions {
+                let region_file_start = cumulative;
+                let region_file_end = cumulative + r.size as u64;
+
+                if file_off >= region_file_start && file_off < region_file_end {
+                    let gpa = r.base_address + (file_off - region_file_start);
+                    let avail_in_region = region_file_end - file_off;
+                    let chunk = std::cmp::min(remaining as u64, avail_in_region) as usize;
+
+                    sub_ranges.push(SubRange {
+                        gpa,
+                        gpa_size: chunk,
+                        backend_path: rb.backend_path.clone(),
+                        mmap_offset: file_off,
+                    });
+
+                    file_off += chunk as u64;
+                    remaining -= chunk;
+                    matched = true;
+                    break;
+                }
+                cumulative = region_file_end;
+            }
+            if !matched {
+                return Err(GuestMemoryFromFileError::Restore(
+                    MemoryError::OffsetTooLarge,
+                ));
+            }
+        }
+    }
+
+    // --- Phase 2: open each distinct backend file once ---
+    let mut backend_files: std::collections::HashMap<std::path::PathBuf, Arc<File>> =
+        std::collections::HashMap::new();
+    for sr in &sub_ranges {
+        if !backend_files.contains_key(&sr.backend_path) {
+            let file = File::open(&sr.backend_path)?;
+            backend_files.insert(sr.backend_path.clone(), Arc::new(file));
+        }
+    }
+
+    // --- Phase 3: mmap each sub-range ---
+    let mut guest_memory = Vec::new();
+    for sr in &sub_ranges {
+        eprintln!("DEBUG multi_backend: sub_range gpa=0x{:x} size={} mmap_off={}", sr.gpa, sr.gpa_size, sr.mmap_offset);
+        let file = backend_files
+            .get(&sr.backend_path)
+            .expect("file was opened above")
+            .clone();
+
+        let regions = vec![(GuestAddress(sr.gpa), sr.gpa_size)];
+        let region_mem = memory::snapshot_file_with_offset(
+            file,
+            sr.mmap_offset,
+            regions.into_iter(),
+            track_dirty_pages,
+        )?;
+        guest_memory.extend(region_mem);
+    }
+
+    // Sort by GPA so that KVM slot registration is in ascending order.
+    guest_memory.sort_by_key(|r| r.start_addr().raw_value());
+    eprintln!("DEBUG multi_backend: total guest_memory regions: {}", guest_memory.len());
+    for (i, r) in guest_memory.iter().enumerate() {
+        eprintln!("DEBUG multi_backend: guest_region[{}] start=0x{:x} size={}", i, r.start_addr().raw_value(), r.len());
+    }
+
+    Ok(guest_memory)
 }
 
 /// Error type for [`guest_memory_from_uffd`]
