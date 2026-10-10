@@ -41,7 +41,7 @@ use crate::vmm_config::snapshot::{
 };
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
-    self, GuestAddress, GuestMemoryState, GuestMmapRegion, GuestRegionMmap, GuestRegionType,
+    self, GuestMemoryState, GuestMmapRegion, GuestRegionMmap, GuestRegionType,
     MemoryError,
 };
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
@@ -453,6 +453,7 @@ pub fn restore_from_snapshot(
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
     };
+
     builder::build_microvm_from_snapshot(
         instance_info,
         event_manager,
@@ -510,37 +511,65 @@ fn guest_memory_from_file(
 /// Build guest memory from multiple per-range backends (dual-backend mode).
 ///
 /// Each `RegionBackendConfig` describes a **file offset** range mapped to a
-/// specific backend file at a given offset. The function:
-/// 1. Converts each file offset to a GPA using `GuestMemoryState`, splitting
-///    ranges that cross the MMIO hole.
-/// 2. Opens each distinct backend file once (sharing the `Arc<File>`).
-/// 3. mmaps each sub-range with `MAP_PRIVATE`.
-/// 4. Returns a sorted `Vec<GuestRegionMmap>` for KVM registration.
+/// specific backend file at a given offset.
+///
+/// Strategy:
+/// 1. Find the base backend path (the one covering offset 0).
+/// 2. mmap the entire guest memory from base_fd, exactly like single-backend
+///    (`guest_memory_from_file`). This yields 2 `GuestRegionMmap` entries
+///    (before/after MMIO hole) and only 2 KVM slots.
+/// 3. For each delta region (non-base backend), overlay with `MAP_FIXED` to
+///    replace the base mapping at that HVA range with the delta file.
+///    KVM is unaware of this — it only sees the original 2 contiguous HVA ranges.
 fn guest_memory_from_multi_backend(
     region_backends: &[RegionBackendConfig],
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
 ) -> Result<Vec<GuestRegionMmap>, GuestMemoryFromFileError> {
-    // --- Phase 1: convert file offsets to GPAs, splitting across MMIO hole ---
+    // Identify base and delta backends.
+    // The base backend is the one that covers file offset 0.
+    let base_path = region_backends
+        .iter()
+        .find(|rb| rb.file_offset == 0)
+        .map(|rb| rb.backend_path.as_path())
+        .ok_or(GuestMemoryFromFileError::Restore(
+            MemoryError::OffsetTooLarge,
+        ))?;
 
-    /// A sub-range after file-offset→GPA conversion.
-    struct SubRange {
-        gpa: u64,
-        gpa_size: usize,
-        backend_path: std::path::PathBuf,
-        // mmap offset into the backend device (= original file_offset).
-        mmap_offset: u64,
-    }
+    // Step 1: mmap the entire guest memory from base_fd (same as single-backend).
+    let guest_memory = guest_memory_from_file(base_path, mem_state, track_dirty_pages)?;
 
-    let mut sub_ranges: Vec<SubRange> = Vec::new();
-
-    eprintln!("DEBUG multi_backend: mem_state has {} regions", mem_state.regions.len());
-    for (i, r) in mem_state.regions.iter().enumerate() {
-        eprintln!("DEBUG multi_backend: region[{}] base=0x{:x} size={} (0x{:x})", i, r.base_address, r.size, r.size);
-    }
-
+    // Step 2: for each delta region, overlay with MAP_FIXED.
+    // Collect delta regions (any region whose backend_path != base_path).
+    let mut delta_regions: Vec<&RegionBackendConfig> = Vec::new();
     for rb in region_backends {
-        eprintln!("DEBUG multi_backend: region_backend file_offset={} size={} path={}", rb.file_offset, rb.size, rb.backend_path.display());
+        if rb.backend_path != base_path {
+            delta_regions.push(rb);
+        }
+    }
+
+    if delta_regions.is_empty() {
+        return Ok(guest_memory);
+    }
+
+    // Open delta file(s).
+    let mut delta_files: std::collections::HashMap<std::path::PathBuf, Arc<File>> =
+        std::collections::HashMap::new();
+    for rb in &delta_regions {
+        if !delta_files.contains_key(&rb.backend_path) {
+            let file = File::open(&rb.backend_path)?;
+            delta_files.insert(rb.backend_path.clone(), Arc::new(file));
+        }
+    }
+
+    // For each delta region, compute the HVA and mmap with MAP_FIXED.
+    for rb in &delta_regions {
+        let delta_file = delta_files
+            .get(&rb.backend_path)
+            .expect("file opened above")
+            .clone();
+
+        // Convert file_offset → GPA, handling MMIO hole splits.
         let mut file_off = rb.file_offset;
         let mut remaining = usize::try_from(rb.size)
             .map_err(|_| MemoryError::OffsetTooLarge)?;
@@ -549,21 +578,36 @@ fn guest_memory_from_multi_backend(
             // Find which guest memory region this file offset falls into.
             let mut cumulative = 0u64;
             let mut matched = false;
-            for r in &mem_state.regions {
+            for (region_idx, r) in mem_state.regions.iter().enumerate() {
                 let region_file_start = cumulative;
                 let region_file_end = cumulative + r.size as u64;
 
                 if file_off >= region_file_start && file_off < region_file_end {
-                    let gpa = r.base_address + (file_off - region_file_start);
                     let avail_in_region = region_file_end - file_off;
                     let chunk = std::cmp::min(remaining as u64, avail_in_region) as usize;
 
-                    sub_ranges.push(SubRange {
-                        gpa,
-                        gpa_size: chunk,
-                        backend_path: rb.backend_path.clone(),
-                        mmap_offset: file_off,
-                    });
+                    // Get the HVA of this chunk from the base mmap.
+                    let guest_region = &guest_memory[region_idx];
+                    let hva_base = guest_region.as_ptr() as usize;
+                    let offset_in_region = (file_off - region_file_start) as usize;
+                    let target_hva = hva_base + offset_in_region;
+
+                    // mmap with MAP_FIXED to overlay the delta file at this HVA.
+                    let ret = unsafe {
+                        libc::mmap(
+                            target_hva as *mut libc::c_void,
+                            chunk,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_PRIVATE | libc::MAP_FIXED,
+                            delta_file.as_raw_fd(),
+                            file_off as libc::off_t,
+                        )
+                    };
+                    if ret == libc::MAP_FAILED {
+                        return Err(GuestMemoryFromFileError::File(
+                            std::io::Error::last_os_error(),
+                        ));
+                    }
 
                     file_off += chunk as u64;
                     remaining -= chunk;
@@ -578,42 +622,6 @@ fn guest_memory_from_multi_backend(
                 ));
             }
         }
-    }
-
-    // --- Phase 2: open each distinct backend file once ---
-    let mut backend_files: std::collections::HashMap<std::path::PathBuf, Arc<File>> =
-        std::collections::HashMap::new();
-    for sr in &sub_ranges {
-        if !backend_files.contains_key(&sr.backend_path) {
-            let file = File::open(&sr.backend_path)?;
-            backend_files.insert(sr.backend_path.clone(), Arc::new(file));
-        }
-    }
-
-    // --- Phase 3: mmap each sub-range ---
-    let mut guest_memory = Vec::new();
-    for sr in &sub_ranges {
-        eprintln!("DEBUG multi_backend: sub_range gpa=0x{:x} size={} mmap_off={}", sr.gpa, sr.gpa_size, sr.mmap_offset);
-        let file = backend_files
-            .get(&sr.backend_path)
-            .expect("file was opened above")
-            .clone();
-
-        let regions = vec![(GuestAddress(sr.gpa), sr.gpa_size)];
-        let region_mem = memory::snapshot_file_with_offset(
-            file,
-            sr.mmap_offset,
-            regions.into_iter(),
-            track_dirty_pages,
-        )?;
-        guest_memory.extend(region_mem);
-    }
-
-    // Sort by GPA so that KVM slot registration is in ascending order.
-    guest_memory.sort_by_key(|r| r.start_addr().raw_value());
-    eprintln!("DEBUG multi_backend: total guest_memory regions: {}", guest_memory.len());
-    for (i, r) in guest_memory.iter().enumerate() {
-        eprintln!("DEBUG multi_backend: guest_region[{}] start=0x{:x} size={}", i, r.start_addr().raw_value(), r.len());
     }
 
     Ok(guest_memory)
