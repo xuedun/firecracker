@@ -77,15 +77,17 @@ pub const FDT_MAX_SIZE: usize = 0x20_0000;
 // * less than 1023 and
 // * a multiple of 32.
 // The first 32 SPIs are reserved, but KVM already shifts the gsi we
-// pass, so we go from 0 to 95 for legacy gsis ("irq") and the remaining
-// we use for MSI.
+// pass, so we go from 0 to 959 for legacy gsis ("irq") and the remaining
+// we use for MSI. 960 legacy GSIs raise the per-VM virtio-mmio device
+// ceiling from 96 to ~1000 (nr_irqs = 960 + 32 = 992, the largest
+// multiple of 32 accepted by KVM's VGIC_MAX_RESERVED = 1023 check).
 /// Offset of first SPI in the GIC
 pub const SPI_START: u32 = 32;
-/// Last possible SPI in the GIC (128 total SPIs)
-pub const SPI_END: u32 = 127;
+/// Last possible SPI in the GIC (960 total SPIs)
+pub const SPI_END: u32 = 991;
 /// First usable GSI id on aarch64 (corresponds to SPI #32).
 pub const GSI_LEGACY_START: u32 = 0;
-/// There are 128 SPIs available, but the first 32 are reserved
+/// There are 992 SPIs available, but the first 32 are reserved
 pub const GSI_LEGACY_NUM: u32 = SPI_END - SPI_START + 1;
 /// Last available GSI
 pub const GSI_LEGACY_END: u32 = GSI_LEGACY_START + GSI_LEGACY_NUM - 1;

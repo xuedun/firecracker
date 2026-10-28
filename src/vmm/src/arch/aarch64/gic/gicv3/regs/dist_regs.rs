@@ -169,6 +169,16 @@ mod tests {
         let simple_dist_reg = DistReg::simple(0, 4);
         let shared_dist_reg = DistReg::shared_irq(0x0010, 2);
         assert_eq!(simple_dist_reg.range(), Range { start: 0, end: 4 });
-        assert_eq!(shared_dist_reg.range(), Range { start: 24, end: 48 });
+        // Derive the expected range from the layout constants instead of
+        // hardcoding it, so raising the SPI count does not break this test.
+        let start = 0x0010 + u64::from(SPI_START) * 2 / 8;
+        let size_in_bytes = u64::from(GSI_LEGACY_NUM) * 2 / 8;
+        assert_eq!(
+            shared_dist_reg.range(),
+            Range {
+                start,
+                end: start + size_in_bytes
+            }
+        );
     }
 }
